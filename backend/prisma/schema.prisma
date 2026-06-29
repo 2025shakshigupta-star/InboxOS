@@ -23,13 +23,15 @@ model Thread {
 }
 
 model Email {
-  id        String   @id @default(uuid())
-  sender    String
-  recipient String
-  subject   String
-  body      String
-  status    String   @default("UNREAD")
-  createdAt DateTime @default(now())
+  id          String   @id @default(uuid())
+  messageId   String   @unique
+  inReplyTo   String?
+  sender      String
+  recipient   String
+  subject     String
+  body        String
+  status      String   @default("UNREAD")
+  createdAt   DateTime @default(now())
 
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)

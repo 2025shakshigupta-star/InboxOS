@@ -1,6 +1,7 @@
 import express, { Request, Response } from 'express';
 import cookieParser from 'cookie-parser';
 import { PrismaClient } from '@prisma/client';
+import { z } from 'zod';
 import { AuthService } from './services/auth.service';
 import { requireAuth, AuthenticatedRequest } from './middleware/auth.middleware';
 
@@ -126,6 +127,100 @@ app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res: Response) 
   return res.status(200).json({
     user: req.user,
   });
+});
+
+/**
+ * POST /api/webhooks/incoming
+ * Webhook endpoint that ingests incoming emails, checks for thread association,
+ * validates body structures via Zod, and creates records in PostgreSQL.
+ */
+const incomingEmailSchema = z.object({
+  sender: z.string().email(),
+  recipient: z.string().email(),
+  subject: z.string(),
+  body: z.string(),
+  messageId: z.string(),
+  inReplyTo: z.string().optional(),
+});
+
+app.post('/api/webhooks/incoming', async (req: Request, res: Response) => {
+  try {
+    // 1. Strict payload validation with Zod
+    const validation = incomingEmailSchema.safeParse(req.body);
+    if (!validation.success) {
+      return res.status(400).json({
+        error: 'Invalid payload schema',
+        details: validation.error.flatten(),
+      });
+    }
+
+    const { sender, recipient, subject, body, messageId, inReplyTo } = validation.data;
+
+    // 2. Fetch or dynamically create the recipient User
+    let user = await prisma.user.findUnique({
+      where: { email: recipient },
+    });
+
+    if (!user) {
+      user = await prisma.user.create({
+        data: {
+          email: recipient,
+          passwordHash: await AuthService.hashPassword('webhook-generated-password-hash'),
+        },
+      });
+    }
+
+    // 3. Check for thread association via In-Reply-To header / messageId
+    let threadId: string | null = null;
+    if (inReplyTo) {
+      const previousEmail = await prisma.email.findUnique({
+        where: { messageId: inReplyTo },
+      });
+      if (previousEmail) {
+        threadId = previousEmail.threadId;
+      }
+    }
+
+    // If no existing thread is found, spin up a new Thread
+    if (!threadId) {
+      const newThread = await prisma.thread.create({
+        data: {
+          summary: `Thread for: ${subject}`,
+        },
+      });
+      threadId = newThread.id;
+    }
+
+    // 4. Create the Email record
+    const emailRecord = await prisma.email.create({
+      data: {
+        messageId,
+        inReplyTo: inReplyTo || null,
+        sender,
+        recipient,
+        subject,
+        body,
+        status: 'UNREAD',
+        userId: user.id,
+        threadId,
+      },
+    });
+
+    // 5. Return 201 Created immediately
+    return res.status(201).json({
+      message: 'Email ingested successfully',
+      email: {
+        id: emailRecord.id,
+        messageId: emailRecord.messageId,
+        subject: emailRecord.subject,
+        threadId: emailRecord.threadId,
+        createdAt: emailRecord.createdAt,
+      },
+    });
+  } catch (error) {
+    console.error('Incoming webhook error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Start Server
