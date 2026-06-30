@@ -1,10 +1,13 @@
 import OpenAI from 'openai';
 import { GoogleGenAI } from '@google/genai';
+import { PrismaClient } from '@prisma/client';
 import * as dotenv from 'dotenv';
 import * as path from 'path';
 
 // Load environment variables from the shared configuration directory
 dotenv.config({ path: path.resolve(__dirname, '../../../config/env/.env') });
+
+const prisma = new PrismaClient();
 
 export type EmailCategory = 'urgent' | 'newsletter' | 'personal' | 'work' | 'spam';
 
@@ -207,4 +210,154 @@ Provide a confidence score between 0.0 and 1.0.`;
 
     throw new Error('Unknown error during Gemini email classification.');
   }
+
+  /**
+   * Generates a 2-3 sentence summary of an email thread and saves it to the Thread model.
+   * Fetches all emails belonging to the thread ordered by date, truncates content to 8000 tokens
+   * using a conservative heuristic (1 token = 4 characters), and prompts the LLM.
+   */
+  public static async generateSummary(threadId: string): Promise<string> {
+    // 1. Fetch all Emails belonging to the thread ordered by date (oldest to newest)
+    const emails = await prisma.email.findMany({
+      where: { threadId },
+      orderBy: {
+        createdAt: 'asc',
+      },
+    });
+
+    if (emails.length === 0) {
+      throw new Error(`No emails found for thread ID: ${threadId}`);
+    }
+
+    // 2. Concatenate the bodies into a single string
+    const concatenatedBodies = emails.map(email => email.body).join('\n\n');
+
+    // 3. Truncate the concatenated string to a maximum of 8000 tokens (approx 32,000 characters)
+    const truncatedText = this.truncateToTokens(concatenatedBodies, 8000);
+
+    // 4. Prompt the LLM depending on active provider
+    const provider = process.env.AI_PROVIDER || 'openai';
+    let summary = '';
+
+    if (provider === 'gemini') {
+      summary = await this.summarizeWithGemini(truncatedText);
+    } else {
+      summary = await this.summarizeWithOpenAI(truncatedText);
+    }
+
+    // 5. Save the summary to the Thread model
+    await prisma.thread.update({
+      where: { id: threadId },
+      data: {
+        summary: summary,
+      },
+    });
+
+    return summary;
+  }
+
+  private static truncateToTokens(text: string, maxTokens: number): string {
+    const maxChars = maxTokens * 4;
+    if (text.length > maxChars) {
+      return text.substring(0, maxChars);
+    }
+    return text;
+  }
+
+  private static async summarizeWithOpenAI(threadContent: string): Promise<string> {
+    const openai = this.getOpenAI();
+    const systemPrompt = 'Summarize the following email thread in 2-3 sentences. Focus on the main outcome or required action.';
+
+    const maxAttempts = 5;
+    let attempt = 0;
+    let delay = 1000;
+
+    while (attempt < maxAttempts) {
+      try {
+        const response = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: threadContent },
+          ],
+        });
+
+        const summary = response.choices[0]?.message?.content?.trim();
+        if (!summary) {
+          throw new Error('OpenAI returned an empty summary response.');
+        }
+
+        return summary;
+      } catch (error: any) {
+        attempt++;
+        const isRateLimit = error.status === 429 || (error.message && error.message.includes('429'));
+
+        if (isRateLimit && attempt < maxAttempts) {
+          console.warn(
+            `[AIService] OpenAI Rate limit hit (429). Retrying in ${delay}ms... (Attempt ${attempt}/${maxAttempts})`
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay *= 2;
+        } else {
+          console.error(`[AIService] OpenAI summarization failed on attempt ${attempt}:`, error);
+          if (attempt >= maxAttempts) {
+            throw new Error(`Failed to summarize thread via OpenAI after ${maxAttempts} attempts: ${error.message || error}`);
+          }
+          throw error;
+        }
+      }
+    }
+
+    throw new Error('Unknown error during OpenAI thread summarization.');
+  }
+
+  private static async summarizeWithGemini(threadContent: string): Promise<string> {
+    const ai = this.getGemini();
+    const systemInstruction = 'Summarize the following email thread in 2-3 sentences. Focus on the main outcome or required action.';
+
+    const maxAttempts = 5;
+    let attempt = 0;
+    let delay = 1000;
+
+    while (attempt < maxAttempts) {
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: threadContent,
+          config: {
+            systemInstruction: systemInstruction,
+          },
+        });
+
+        const summary = response.text?.trim();
+        if (!summary) {
+          throw new Error('Gemini returned an empty summary response.');
+        }
+
+        return summary;
+      } catch (error: any) {
+        attempt++;
+        const isRateLimit =
+          error.status === 429 ||
+          (error.message && (error.message.includes('429') || error.message.includes('ResourceExhausted') || error.message.includes('Quota exceeded') || error.message.includes('quota')));
+
+        if (isRateLimit && attempt < maxAttempts) {
+          console.warn(
+            `[AIService] Gemini Rate limit hit (429/ResourceExhausted). Retrying in ${delay}ms... (Attempt ${attempt}/${maxAttempts})`
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay *= 2;
+        } else {
+          console.error(`[AIService] Gemini summarization failed on attempt ${attempt}:`, error);
+          if (attempt >= maxAttempts) {
+            throw new Error(`Failed to summarize thread via Gemini after ${maxAttempts} attempts: ${error.message || error}`);
+          }
+          throw error;
+        }
+      }
+    }
+
+    throw new Error('Unknown error during Gemini thread summarization.');
+  }
 }
+
